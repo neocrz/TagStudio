@@ -854,7 +854,6 @@ class QtDriver(DriverMixin, QObject):
         # Note: get_entries_full can return None if an ID is not found, filter those out
         entries_to_copy = [entry for entry in self.lib.get_entries_full(self.selected) if entry]
 
-
         if not entries_to_copy:
             logger.warning("[QtDriver] No valid entries found among selected IDs for copying.")
             self.main_window.statusbar.showMessage(Translations["status.copy_selected_files.no_valid_selection"])
@@ -865,10 +864,14 @@ class QtDriver(DriverMixin, QObject):
         pw = ProgressWidget(
             cancel_button_text=Translations["generic.cancel"], # Allow cancelling the copy
             minimum=0,
-            maximum=len(entries_to_copy),
-            window_title=Translations["dialog.copy_selected_files.title"],
-            label_text=Translations.format("status.copy_selected_files.in_progress", count=len(entries_to_copy)),
+            maximum=len(entries_to_copy), # Set max immediately
+            window_title=Translations["dialog.copy_selected_files.title"], # Ensure window title is set
+            # Set initial label text directly in the constructor with padding
+            # This helps ensure the dialog has content before the first progress update
+            label_text=Translations.format("status.copy_selected_files.in_progress", count=len(entries_to_copy)) + "\n\n",
         )
+
+
         pw.show()
 
         # Setup background task
@@ -898,9 +901,9 @@ class QtDriver(DriverMixin, QObject):
 
             return copied_count # Return total successful copies on completion
 
-
-        # Setup iterator for progress updates
+        # Setup iterator for progress updates. Pass the generator function itself.
         iterator = FunctionIterator(copy_files_runnable)
+
 
         def update_progress_label(data):
             index, success, path = data
@@ -916,13 +919,20 @@ class QtDriver(DriverMixin, QObject):
             )
             pw.update_progress(index + 1) # Update the progress bar value
 
+        # Connect the FunctionIterator's 'value' signal to the progress update slot
         iterator.value.connect(update_progress_label)
 
 
         # Setup completion action
-        def on_copy_complete(total_copied):
+        def on_copy_complete(total_copied): # This will receive the result emitted by FunctionIterator
             pw.hide()
             pw.deleteLater()
+            if total_copied is None: # Handle potential None result from error
+                 self.main_window.statusbar.showMessage(Translations.format("status.copy_selected_files.failure", total_count=len(entries_to_copy)))
+                 logger.error("[QtDriver] Copy operation finished with None result, likely due to an error.")
+                 return
+
+
             if total_copied == len(entries_to_copy):
                 self.main_window.statusbar.showMessage(
                     Translations.format("status.copy_selected_files.success", count=total_copied)
@@ -931,29 +941,33 @@ class QtDriver(DriverMixin, QObject):
                  self.main_window.statusbar.showMessage(
                     Translations.format("status.copy_selected_files.partial_success", success_count=total_copied, total_count=len(entries_to_copy))
                  )
-            else:
+            else: # total_copied is 0
                 self.main_window.statusbar.showMessage(
                     Translations.format("status.copy_selected_files.failure", total_count=len(entries_to_copy))
                 )
             logger.info(f"[QtDriver] Copy operation completed. Copied {total_copied}/{len(entries_to_copy)} files.")
 
-
         # Run the task in the thread pool
-        runnable = CustomRunnable(lambda: on_copy_complete(list(iterator.run()))) # Wrap the iterator's run() in a callable for CustomRunnable
+        # CustomRunnable will run the FunctionIterator's run method
+        runnable = CustomRunnable(iterator.run)
         QThreadPool.globalInstance().start(runnable)
 
-        # Handle cancellation (optional but good practice for long operations)
-        # If the user cancels the ProgressDialog, the runnable continues but progress stops updating.
-        # To truly cancel, you'd need to add cancellation logic to the copy_files_runnable
-        # and check for a cancelled flag, and potentially use the QThread's terminate() (caution advised).
-        # For this example, we just stop updating the UI and let the background task finish.
+        # Connect the FunctionIterator's signal that carries the final result to the completion callback
+        iterator.finished_with_result.connect(on_copy_complete)
+
+        # Handle cancellation
         def on_dialog_cancelled():
             logger.info("[QtDriver] Copy operation UI cancelled by user.")
-            # Stop updating progress if the dialog is cancelled
-            with contextlib.suppress(TypeError, RuntimeError): # Handle potential disconnect issues
+            # Disconnecting the value signal stops UI updates
+            # Use a suppress block as disconnecting an already disconnected signal raises an error
+            with contextlib.suppress(TypeError, RuntimeError):
                  iterator.value.disconnect(update_progress_label)
             # Note: The background copy task is still running.
-        pw.canceled.connect(on_dialog_cancelled)
+            # To truly cancel, you'd need to add cancellation logic within the copy_files_runnable itself
+            # and check for a cancellation request (e.g., using QThread.currentThread().isInterruptionRequested())
+
+        # Fix the AttributeError: connect the signal from the internal QProgressDialog (self.pb)
+        pw.pb.canceled.connect(on_dialog_cancelled)
 
 
     def init_file_extension_manager(self):
