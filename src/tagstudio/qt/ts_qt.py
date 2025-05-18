@@ -825,15 +825,14 @@ class QtDriver(DriverMixin, QObject):
             self.main_window.statusbar.showMessage(Translations["status.copy_selected_files.no_selection"])
             return
 
-        # Prompt user for destination directory
         destination_dir_str = QFileDialog.getExistingDirectory(
             parent=self.main_window,
             caption=Translations["dialog.copy_selected_files.title"],
-            dir=str(self.lib.library_dir) if self.lib.library_dir else "/", # Start dialog in the current library dir if available, otherwise root
+            dir=str(self.lib.library_dir) if self.lib.library_dir else "/",
             options=QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks,
         )
 
-        if not destination_dir_str: # User cancelled the dialog
+        if not destination_dir_str:
             logger.info("[QtDriver] Copy destination selection cancelled.")
             self.main_window.statusbar.showMessage(Translations["status.copy_selected_files.cancelled"])
             return
@@ -848,11 +847,8 @@ class QtDriver(DriverMixin, QObject):
              )
              return
 
-
-        # Get the actual Entry objects for the selected IDs
-        # We use get_entries_full here to ensure we get valid entries, though we only need the path
-        # Note: get_entries_full can return None if an ID is not found, filter those out
         entries_to_copy = [entry for entry in self.lib.get_entries_full(self.selected) if entry]
+
 
         if not entries_to_copy:
             logger.warning("[QtDriver] No valid entries found among selected IDs for copying.")
@@ -860,48 +856,46 @@ class QtDriver(DriverMixin, QObject):
             return
 
 
-        # Setup progress dialog
         pw = ProgressWidget(
-            cancel_button_text=Translations["generic.cancel"], # Allow cancelling the copy
+            cancel_button_text=Translations["generic.cancel"],
             minimum=0,
-            maximum=len(entries_to_copy), # Set max immediately
-            window_title=Translations["dialog.copy_selected_files.title"], # Ensure window title is set
-            # Set initial label text directly in the constructor with padding
-            # This helps ensure the dialog has content before the first progress update
+            maximum=len(entries_to_copy),
+            window_title=Translations["dialog.copy_selected_files.title"], 
             label_text=Translations.format("status.copy_selected_files.in_progress", count=len(entries_to_copy)) + "\n\n",
         )
 
+        progress_dialog = pw.pb
 
         pw.show()
 
-        # Setup background task
         def copy_files_runnable():
             copied_count = 0
             for i, entry in enumerate(entries_to_copy):
+                if progress_dialog.wasCanceled():
+                    logger.info("[QtDriver] Copy operation cancelled during execution.")
+                    return copied_count
+
+
                 source_path = self.lib.library_dir / entry.path
-                # Copy just the file, not the source sub-directory structure
                 dest_path = destination_dir / entry.path.name
 
                 if not source_path.exists():
                     logger.warning(f"[QtDriver] Source file not found for copying: {source_path}")
-                    # We could yield here with a special value to indicate skipped,
-                    # but for simplicity, we just log and move on.
-                    yield (i, False, source_path) # Indicate failure for this file
+
+                    yield (i, False, source_path)
                     continue
 
                 try:
-                    # Use copy2 to preserve metadata if possible
                     shutil.copy2(source_path, dest_path)
                     copied_count += 1
-                    yield (i, True, source_path) # Indicate success and current file
+                    yield (i, True, source_path) 
                 except Exception as e:
                     logger.error(f"[QtDriver] Failed to copy file {source_path} to {dest_path}: {e}")
-                    # Again, log and move on, indicate failure
+
                     yield (i, False, source_path)
 
-            return copied_count # Return total successful copies on completion
+            return copied_count
 
-        # Setup iterator for progress updates. Pass the generator function itself.
         iterator = FunctionIterator(copy_files_runnable)
 
 
@@ -915,19 +909,24 @@ class QtDriver(DriverMixin, QObject):
                      total=len(entries_to_copy),
                      status=status_text,
                      filename=path.name,
-                 )
+                 ) + "\n\n" 
             )
-            pw.update_progress(index + 1) # Update the progress bar value
+            pw.update_progress(index + 1)
 
-        # Connect the FunctionIterator's 'value' signal to the progress update slot
         iterator.value.connect(update_progress_label)
 
 
-        # Setup completion action
-        def on_copy_complete(total_copied): # This will receive the result emitted by FunctionIterator
+        def on_copy_complete(total_copied): 
             pw.hide()
             pw.deleteLater()
-            if total_copied is None: # Handle potential None result from error
+
+            if progress_dialog.wasCanceled():
+                 self.main_window.statusbar.showMessage(Translations["status.copy_selected_files.cancelled"])
+                 logger.info("[QtDriver] Copy operation cancelled by user (completion handler).")
+                 return
+
+
+            if total_copied is None:
                  self.main_window.statusbar.showMessage(Translations.format("status.copy_selected_files.failure", total_count=len(entries_to_copy)))
                  logger.error("[QtDriver] Copy operation finished with None result, likely due to an error.")
                  return
@@ -941,32 +940,21 @@ class QtDriver(DriverMixin, QObject):
                  self.main_window.statusbar.showMessage(
                     Translations.format("status.copy_selected_files.partial_success", success_count=total_copied, total_count=len(entries_to_copy))
                  )
-            else: # total_copied is 0
+            else:
                 self.main_window.statusbar.showMessage(
                     Translations.format("status.copy_selected_files.failure", total_count=len(entries_to_copy))
                 )
             logger.info(f"[QtDriver] Copy operation completed. Copied {total_copied}/{len(entries_to_copy)} files.")
 
-        # Run the task in the thread pool
-        # CustomRunnable will run the FunctionIterator's run method
         runnable = CustomRunnable(iterator.run)
         QThreadPool.globalInstance().start(runnable)
 
-        # Connect the FunctionIterator's signal that carries the final result to the completion callback
         iterator.finished_with_result.connect(on_copy_complete)
 
-        # Handle cancellation
         def on_dialog_cancelled():
-            logger.info("[QtDriver] Copy operation UI cancelled by user.")
-            # Disconnecting the value signal stops UI updates
-            # Use a suppress block as disconnecting an already disconnected signal raises an error
+            logger.info("[QtDriver] Progress dialog cancellation button pressed.")
             with contextlib.suppress(TypeError, RuntimeError):
                  iterator.value.disconnect(update_progress_label)
-            # Note: The background copy task is still running.
-            # To truly cancel, you'd need to add cancellation logic within the copy_files_runnable itself
-            # and check for a cancellation request (e.g., using QThread.currentThread().isInterruptionRequested())
-
-        # Fix the AttributeError: connect the signal from the internal QProgressDialog (self.pb)
         pw.pb.canceled.connect(on_dialog_cancelled)
 
 
