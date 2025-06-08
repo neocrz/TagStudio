@@ -50,6 +50,7 @@ class GlobalSettings(BaseModel):
     show_filepath: ShowFilepathOption = Field(default=ShowFilepathOption.DEFAULT)
     theme: Theme = Field(default=Theme.SYSTEM)
     global_filter: str = Field(default="")
+    is_global_filter_enabled: bool = Field(default=True)
 
     @staticmethod
     def read_settings(path: Path = DEFAULT_GLOBAL_SETTINGS_PATH) -> "GlobalSettings":

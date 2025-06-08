@@ -177,7 +177,7 @@ class QtDriver(DriverMixin, QObject):
         self.pages_count = 0
         self.applied_theme = None
  
-        self.is_global_filter_active: bool = True
+        self.is_global_filter_active: bool = False # Will be set from settings
         self.global_filter_ast: AST | None = None
         self.scrollbar_pos = 0
         self.thumb_size = 128
@@ -769,6 +769,9 @@ class QtDriver(DriverMixin, QObject):
         # Search Field
         search_field: QLineEdit = self.main_window.searchField
         search_field.returnPressed.connect(self.run_search_from_ui)
+        # Global Filter Checkbox
+        self.main_window.global_filter_checkbox.setChecked(self.settings.is_global_filter_enabled)
+        self.main_window.global_filter_checkbox.toggled.connect(self.toggle_global_filter)
         # Sorting Dropdowns
         sort_mode_dropdown: QComboBox = self.main_window.sorting_mode_combobox
         for sort_mode in SortingModeEnum:
@@ -1063,6 +1066,11 @@ class QtDriver(DriverMixin, QObject):
  
     def toggle_global_filter(self, checked: bool):
         self.is_global_filter_active = checked
+        self.settings.is_global_filter_enabled = checked
+        self.settings.save()
+        # If the global filter is being disabled, ensure its AST is cleared
+        if not checked:
+            self.global_filter_ast = None
         self.run_current_search()
  
     def update_global_filter_ast(self):
@@ -1078,8 +1086,6 @@ class QtDriver(DriverMixin, QObject):
         else:
             self.global_filter_ast = None
             self.main_window.global_filter_checkbox.setHidden(True)
-        self.is_global_filter_active = True
-        self.main_window.global_filter_checkbox.setChecked(True)
 
     def backup_library(self):
         logger.info("Backing Up Library...")
@@ -2108,8 +2114,10 @@ class QtDriver(DriverMixin, QObject):
  
         self.filter.page_size = self.settings.page_size
  
-        # TODO - make this call optional
         self.update_global_filter_ast()
+        # Synchronize the internal flag with the loaded setting
+        self.is_global_filter_active = self.settings.is_global_filter_enabled
+        self.main_window.global_filter_checkbox.setChecked(self.is_global_filter_active)
         self.add_new_files_callback()
  
         if self.settings.show_filepath == ShowFilepathOption.SHOW_FULL_PATHS:
