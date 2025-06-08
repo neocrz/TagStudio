@@ -18,16 +18,18 @@ import re
 import sys
 import time
 from argparse import Namespace
+from datetime import datetime
 from pathlib import Path
 from queue import Queue
 from shutil import which
 import shutil
+from typing import Optional
 from warnings import catch_warnings
 
 import structlog
 from humanfriendly import format_size, format_timespan
 from PySide6 import QtCore
-from PySide6.QtCore import QObject, QSettings, Qt, QThread, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QThreadPool, QTimer, Signal, QKeyCombination
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -45,7 +47,9 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFileDialog,
+    QHBoxLayout,
     QLineEdit,
+    QCheckBox,
     QMenu,
     QMenuBar,
     QMessageBox,
@@ -59,19 +63,22 @@ import tagstudio.qt.resources_rc  # noqa: F401
 from tagstudio.core.constants import TAG_ARCHIVED, TAG_FAVORITE, VERSION, VERSION_BRANCH
 from tagstudio.core.driver import DriverMixin
 from tagstudio.core.enums import MacroID, SettingItems, ShowFilepathOption
-from tagstudio.core.global_settings import DEFAULT_GLOBAL_SETTINGS_PATH, GlobalSettings, Theme
+from tagstudio.core.global_settings import DEFAULT_GLOBAL_SETTINGS_PATH, GlobalSettings
 from tagstudio.core.library.alchemy.enums import (
     FieldTypeEnum,
     FilterState,
     ItemType,
     SortingModeEnum,
 )
+from tagstudio.core.global_settings import Theme
 from tagstudio.core.library.alchemy.fields import _FieldID
 from tagstudio.core.library.alchemy.library import Library, LibraryStatus
 from tagstudio.core.library.alchemy.models import Entry
 from tagstudio.core.media_types import MediaCategories
 from tagstudio.core.palette import ColorType, UiColor, get_ui_color
 from tagstudio.core.query_lang.util import ParsingError
+from tagstudio.core.query_lang.parser import Parser
+from tagstudio.core.query_lang.ast import AST, ANDList, ORList
 from tagstudio.core.ts_core import TagStudioCore
 from tagstudio.core.utils.refresh_dir import RefreshDirTracker
 from tagstudio.core.utils.web import strip_web_protocol
@@ -155,8 +162,8 @@ class QtDriver(DriverMixin, QObject):
     about_modal: AboutModal
     unlinked_modal: FixUnlinkedEntriesModal
     dupe_modal: FixDupeFilesModal
-    applied_theme: Theme
-
+    applied_theme: Optional[Theme]
+ 
     lib: Library
 
     def __init__(self, args: Namespace):
@@ -169,7 +176,9 @@ class QtDriver(DriverMixin, QObject):
         self.frame_content: list[int] = []  # List of Entry IDs on the current page
         self.pages_count = 0
         self.applied_theme = None
-
+ 
+        self.is_global_filter_active: bool = True
+        self.global_filter_ast: AST | None = None
         self.scrollbar_pos = 0
         self.thumb_size = 128
         self.spacing = None
@@ -303,12 +312,13 @@ class QtDriver(DriverMixin, QObject):
         # allow to process input from console, eg. SIGTERM
         timer = QTimer()
         timer.start(500)
-        timer.timeout.connect(lambda: None)
-
+        timer.timeout.connect(lambda: None)  # type: ignore
+ 
         # self.main_window = loader.load(home_path)
         self.main_window = Ui_MainWindow(self)
         self.main_window.setWindowTitle(self.base_title)
-        self.main_window.mousePressEvent = self.mouse_navigation
+ 
+ 
         self.main_window.dragEnterEvent = self.drag_enter_event
         self.main_window.dragMoveEvent = self.drag_move_event
         self.main_window.dropEvent = self.drop_event
@@ -711,8 +721,8 @@ class QtDriver(DriverMixin, QObject):
         self.thumb_renderers: list[ThumbRenderer] = []
         self.filter = FilterState.show_all(page_size=self.settings.page_size)
         self.init_library_window()
-        self.migration_modal: JsonMigrationModal = None
-
+        self.migration_modal: JsonMigrationModal | None = None
+ 
         path_result = self.evaluate_path(str(self.args.open).lstrip().rstrip())
         if path_result.success and path_result.library_path:
             self.open_library(path_result.library_path)
@@ -747,34 +757,18 @@ class QtDriver(DriverMixin, QObject):
 
     def init_library_window(self):
         # self._init_landing_page() # Taken care of inside the widget now
-
+ 
         # TODO: Put this into its own method that copies the font file(s) into memory
         # so the resource isn't being used, then store the specific size variations
         # in a global dict for methods to access for different DPIs.
         # adj_font_size = math.floor(12 * self.main_window.devicePixelRatio())
-
-        def _filter_items():
-            try:
-                self.filter_items(
-                    FilterState.from_search_query(
-                        self.main_window.searchField.text(), page_size=self.settings.page_size
-                    )
-                    .with_sorting_mode(self.sorting_mode)
-                    .with_sorting_direction(self.sorting_direction)
-                )
-            except ParsingError as e:
-                self.main_window.statusbar.showMessage(
-                    f"{Translations['status.results.invalid_syntax']} "
-                    f'"{self.main_window.searchField.text()}"'
-                )
-                logger.error("[QtDriver] Could not filter items", error=e)
-
+ 
         # Search Button
         search_button: QPushButton = self.main_window.searchButton
-        search_button.clicked.connect(_filter_items)
+        search_button.clicked.connect(self.run_search_from_ui)
         # Search Field
         search_field: QLineEdit = self.main_window.searchField
-        search_field.returnPressed.connect(_filter_items)
+        search_field.returnPressed.connect(self.run_search_from_ui)
         # Sorting Dropdowns
         sort_mode_dropdown: QComboBox = self.main_window.sorting_mode_combobox
         for sort_mode in SortingModeEnum:
@@ -783,7 +777,7 @@ class QtDriver(DriverMixin, QObject):
             list(SortingModeEnum).index(self.filter.sorting_mode)
         )  # set according to self.filter
         sort_mode_dropdown.currentIndexChanged.connect(self.sorting_mode_callback)
-
+ 
         sort_dir_dropdown: QComboBox = self.main_window.sorting_direction_combobox
         sort_dir_dropdown.addItem("Ascending", userData=True)
         sort_dir_dropdown.addItem("Descending", userData=False)
@@ -791,7 +785,7 @@ class QtDriver(DriverMixin, QObject):
         sort_dir_dropdown.setItemText(1, Translations["sorting.direction.descending"])
         sort_dir_dropdown.setCurrentIndex(1)  # Default: Descending
         sort_dir_dropdown.currentIndexChanged.connect(self.sorting_direction_callback)
-
+ 
         # Thumbnail Size ComboBox
         thumb_size_combobox: QComboBox = self.main_window.thumb_size_combobox
         for size in self.thumb_sizes:
@@ -801,22 +795,23 @@ class QtDriver(DriverMixin, QObject):
             lambda: self.thumb_size_callback(thumb_size_combobox.currentIndex())
         )
         self._init_thumb_grid()
-
+ 
         back_button: QPushButton = self.main_window.backButton
         back_button.clicked.connect(lambda: self.page_move(-1))
         forward_button: QPushButton = self.main_window.forwardButton
         forward_button.clicked.connect(lambda: self.page_move(1))
-
+ 
         # NOTE: Putting this early will result in a white non-responsive
-        # window until everything is loaded. Consider adding a splash screen
+        # window until everything is loaded.
         # or implementing some clever loading tricks.
         self.main_window.show()
         self.main_window.activateWindow()
         self.main_window.toggle_landing_page(enabled=True)
-
+ 
         self.main_window.pagination.index.connect(lambda i: self.page_move(page_id=i))
-
+ 
         self.splash.finish(self.main_window)
+ 
 
     def copy_selected_files_action_callback(self):
         """Prompt for a directory and copy selected files to it."""
@@ -876,9 +871,9 @@ class QtDriver(DriverMixin, QObject):
                     return copied_count
 
 
-                source_path = self.lib.library_dir / entry.path
+                source_path = self.lib.library_dir / entry.path if self.lib.library_dir else entry.path
                 dest_path = destination_dir / entry.path.name
-
+ 
                 if not source_path.exists():
                     logger.warning(f"[QtDriver] Source file not found for copying: {source_path}")
 
@@ -1003,30 +998,25 @@ class QtDriver(DriverMixin, QObject):
 
         QApplication.quit()
 
-    def close_library(self, is_shutdown: bool = False):
-        if not self.lib.library_dir:
+    def close_library(self, is_shutdown: bool = False) -> None:
+        if not self.lib or not self.lib.library_dir:
             logger.info("No Library to Close")
             return
 
         logger.info("Closing Library...")
         self.main_window.statusbar.showMessage(Translations["status.library_closing"])
         start_time = time.time()
-
-        self.cached_values.setValue(SettingItems.LAST_LIBRARY, str(self.lib.library_dir))
-        self.cached_values.sync()
-
-        # Reset library state
-        self.preview_panel.update_widgets()
-        self.main_window.searchField.setText("")
-        scrollbar: QScrollArea = self.main_window.scrollArea
-        scrollbar.verticalScrollBar().setValue(0)
-        self.filter = FilterState.show_all(page_size=self.settings.page_size)
-
         self.lib.close()
-
         self.thumb_job_queue.queue.clear()
+
         if is_shutdown:
             # no need to do other things on shutdown
+            end_time = time.time()
+            self.main_window.statusbar.showMessage(
+                Translations.format(
+                    "status.library_closed", time_span=format_timespan(end_time - start_time)
+                )
+            )
             return
 
         self.main_window.setWindowTitle(self.base_title)
@@ -1070,6 +1060,26 @@ class QtDriver(DriverMixin, QObject):
                 "status.library_closed", time_span=format_timespan(end_time - start_time)
             )
         )
+ 
+    def toggle_global_filter(self, checked: bool):
+        self.is_global_filter_active = checked
+        self.run_current_search()
+ 
+    def update_global_filter_ast(self):
+        """Parses the global_filter string and caches the AST."""
+        if self.settings.global_filter:
+            try:
+                self.global_filter_ast = Parser(self.settings.global_filter).parse()
+                self.main_window.global_filter_checkbox.setHidden(False)
+            except ParsingError as e:
+                self.global_filter_ast = None
+                self.main_window.global_filter_checkbox.setHidden(True)
+                logger.error("Invalid global filter syntax", error=e, filter=self.settings.global_filter)
+        else:
+            self.global_filter_ast = None
+            self.main_window.global_filter_checkbox.setHidden(True)
+        self.is_global_filter_active = True
+        self.main_window.global_filter_checkbox.setChecked(True)
 
     def backup_library(self):
         logger.info("Backing Up Library...")
@@ -1111,7 +1121,7 @@ class QtDriver(DriverMixin, QObject):
         """Set the selection to all visible items."""
         self.selected.clear()
         for item in self.item_thumbs:
-            if item.mode and item.item_id not in self.selected and not item.isHidden():
+            if item.mode and item.item_id is not None and item.item_id not in self.selected and not item.isHidden():
                 self.selected.append(item.item_id)
                 item.thumb_button.set_selected(True)
 
@@ -1173,16 +1183,18 @@ class QtDriver(DriverMixin, QObject):
 
         if len(self.selected) <= 1 and origin_path:
             origin_id_ = origin_id
-            if not origin_id_:
+            if not origin_id_ and self.selected:
                 with contextlib.suppress(IndexError):
                     origin_id_ = self.selected[0]
-
-            pending.append((origin_id_, Path(origin_path)))
-        elif (len(self.selected) > 1) or (len(self.selected) <= 1):
-            for item in self.selected:
-                entry = self.lib.get_entry(item)
-                filepath: Path = entry.path
-                pending.append((item, filepath))
+ 
+            if origin_id_ is not None:
+                pending.append((origin_id_, Path(origin_path)))
+        elif self.selected: # Simplified condition
+            for item_id in self.selected: # Renamed 'item' to 'item_id' for clarity
+                entry = self.lib.get_entry(item_id)
+                if entry and entry.path:
+                    filepath: Path = entry.path
+                    pending.append((item_id, filepath))
 
         if pending:
             return_code = self.delete_file_confirmation(len(pending), pending[0][1])
@@ -1195,7 +1207,7 @@ class QtDriver(DriverMixin, QObject):
                     e_id, f = tup
                     if (origin_path == f) or (not origin_path):
                         self.preview_panel.thumb.stop_file_use()
-                    if delete_file(self.lib.library_dir / f):
+                    if self.lib.library_dir and delete_file(self.lib.library_dir / f):
                         self.main_window.statusbar.showMessage(
                             Translations.format(
                                 "status.deleting_file", i=i, count=len(pending), path=f
@@ -1300,8 +1312,8 @@ class QtDriver(DriverMixin, QObject):
         pw.update_label(Translations["library.refresh.scanning_preparing"])
 
         pw.show()
-
-        iterator = FunctionIterator(lambda: tracker.refresh_dir(self.lib.library_dir))
+ 
+        iterator = FunctionIterator(lambda: tracker.refresh_dir(self.lib.library_dir if self.lib.library_dir else Path(".")))
         iterator.value.connect(
             lambda x: (
                 pw.update_progress(x + 1),
@@ -1380,7 +1392,9 @@ class QtDriver(DriverMixin, QObject):
 
     def run_macro(self, name: MacroID, entry_id: int):
         """Run a specific Macro on an Entry given a Macro name."""
-        entry: Entry = self.lib.get_entry(entry_id)
+        entry: Entry | None = self.lib.get_entry(entry_id)
+        if not entry or not self.lib.library_dir:
+            return
         full_path = self.lib.library_dir / entry.path
         source = "" if entry.path.parent == Path(".") else entry.path.parts[0].lower()
 
@@ -1406,9 +1420,9 @@ class QtDriver(DriverMixin, QObject):
                 self.lib.add_field_to_entry(
                     entry.id,
                     field_id=field_id,
-                    value=value,
+                    value=value if isinstance(value, (str, type(None))) else str(value),
                 )
-
+ 
         elif name == MacroID.BUILD_URL:
             url = TagStudioCore.build_url(entry, source)
             if url is not None:
@@ -1431,20 +1445,24 @@ class QtDriver(DriverMixin, QObject):
 
     def sorting_direction_callback(self):
         logger.info("Sorting Direction Changed", ascending=self.sorting_direction)
-        self.filter_items()
-
+        self.filter.ascending = self.sorting_direction
+        self.filter.page_index = 0
+        self.run_current_search()
+ 
     @property
     def sorting_mode(self) -> SortingModeEnum:
         """What to sort by."""
         return self.main_window.sorting_mode_combobox.currentData()
-
+ 
     def sorting_mode_callback(self):
         logger.info("Sorting Mode Changed", mode=self.sorting_mode)
-        self.filter_items()
-
+        self.filter.sorting_mode = self.sorting_mode
+        self.filter.page_index = 0
+        self.run_current_search()
+ 
     def thumb_size_callback(self, index: int):
         """Perform actions needed when the thumbnail size selection is changed.
-
+ 
         Args:
             index (int): The index of the item_thumbs/ComboBox list to use.
         """
@@ -1456,7 +1474,7 @@ class QtDriver(DriverMixin, QObject):
         else:
             logger.error(f"ERROR: Invalid thumbnail size index ({index}). Defaulting to 128px.")
             self.thumb_size = 128
-
+ 
         self.update_thumbs()
         blank_icon: QIcon = QIcon()
         for it in self.item_thumbs:
@@ -1469,42 +1487,12 @@ class QtDriver(DriverMixin, QObject):
         self.flow_container.layout().setSpacing(
             min(self.thumb_size // spacing_divisor, min_spacing)
         )
-
-    def mouse_navigation(self, event: QMouseEvent):
-        # print(event.button())
-        if event.button() == Qt.MouseButton.ForwardButton:
-            self.page_move(1)
-        elif event.button() == Qt.MouseButton.BackButton:
-            self.page_move(-1)
-
-    def page_move(self, delta: int = None, page_id: int = None) -> None:
-        """Navigate a step further into the navigation stack."""
-        logger.info(
-            "page_move",
-            delta=delta,
-            page_id=page_id,
-        )
-
-        # Ex. User visits | A ->[B]     |
-        #                 | A    B ->[C]|
-        #                 | A   [B]<- C |
-        #                 |[A]<- B    C |  Previous routes still exist
-        #                 | A ->[D]     |  Stack is cut from [:A] on new route
-
-        # sb: QScrollArea = self.main_window.scrollArea
-        # sb_pos = sb.verticalScrollBar().value()
-
-        page_index = page_id if page_id is not None else self.filter.page_index + delta
-        page_index = max(0, min(page_index, self.pages_count - 1))
-
-        self.filter.page_index = page_index
-        # TODO: Re-allow selecting entries across multiple pages at once.
-        # This works fine with additive selection but becomes a nightmare with bridging.
-        self.filter_items()
-
+ 
     def remove_grid_item(self, grid_idx: int):
-        self.frame_content[grid_idx] = None
-        self.item_thumbs[grid_idx].hide()
+        if grid_idx < len(self.frame_content):
+            self.frame_content[grid_idx] = -1 # Use -1 to mark as removed, not None
+        if grid_idx < len(self.item_thumbs):
+            self.item_thumbs[grid_idx].hide()
 
     def _update_thumb_count(self):
         missing_count = max(0, self.filter.page_size - len(self.item_thumbs))
@@ -1774,9 +1762,11 @@ class QtDriver(DriverMixin, QObject):
         logger.info("[QtDriver] Loading Entries...")
         # TODO: The full entries with joins don't need to be grabbed here.
         # Use a method that only selects the frame content but doesn't include the joins.
-        entries: list[Entry] = list(self.lib.get_entries_full(self.frame_content))
+        entries: list[Entry | None] = list(self.lib.get_entries_full(self.frame_content))
         logger.info("[QtDriver] Building Filenames...")
-        filenames: list[Path] = [self.lib.library_dir / e.path for e in entries]
+        filenames: list[Path] = []
+        if self.lib.library_dir:
+            filenames = [self.lib.library_dir / e.path for e in entries if e]
         logger.info("[QtDriver] Done! Processing ItemThumbs...")
         for index, item_thumb in enumerate(self.item_thumbs, start=0):
             entry = None
@@ -1893,47 +1883,79 @@ class QtDriver(DriverMixin, QObject):
                     pending_entries.get(badge_type, []), BADGE_TAGS[badge_type]
                 )
 
-    def filter_items(self, filter: FilterState | None = None) -> None:
+    def run_search_from_ui(self):
         if not self.lib.library_dir:
             logger.info("Library not loaded")
             return
         assert self.lib.engine
-
-        if filter:
-            self.filter = dataclasses.replace(self.filter, **dataclasses.asdict(filter))
-        else:
-            self.filter.sorting_mode = self.sorting_mode
-            self.filter.ascending = self.sorting_direction
-
-        # inform user about running search
+ 
+        try:
+            self.filter.ast = Parser(self.main_window.searchField.text()).parse()
+        except ParsingError as e:
+            self.main_window.statusbar.showMessage(
+                f"{Translations['status.results.invalid_syntax']} "
+                f'"{self.main_window.searchField.text()}"'
+            )
+            logger.error("[QtDriver] Could not parse user query", error=e)
+            return
+ 
+        self.filter.page_index = 0
+        self.run_current_search()
+ 
+    def run_current_search(self):
+        """Runs a search based on the current state of self.filter. Combines with global filter if needed."""
+        if not self.lib.library_dir:
+            return
+ 
         self.main_window.statusbar.showMessage(Translations["status.library_search_query"])
         self.main_window.statusbar.repaint()
-
-        # search the library
+ 
+        search_filter = dataclasses.replace(self.filter)
+ 
+        # Combine with global filter
+        if self.is_global_filter_active and self.global_filter_ast:
+            user_ast = search_filter.ast
+            if user_ast and not (isinstance(user_ast, ORList) and not user_ast.elements):
+                search_filter.ast = ANDList([user_ast, self.global_filter_ast])
+            else:
+                search_filter.ast = self.global_filter_ast
+ 
         start_time = time.time()
-        results = self.lib.search_library(self.filter)
+        results = self.lib.search_library(search_filter)
         logger.info("items to render", count=len(results))
         end_time = time.time()
-
+ 
         # inform user about completed search
         self.main_window.statusbar.showMessage(
             Translations.format(
-                "status.results_found",
-                count=results.total_count,
-                time_span=format_timespan(end_time - start_time),
+                "status.results_found", count=results.total_count, time_span=format_timespan(end_time - start_time)
             )
         )
-
+ 
         # update page content
         self.frame_content = [item.id for item in results.items]
         self.update_thumbs()
-
+ 
         # update pagination
         self.pages_count = math.ceil(results.total_count / self.filter.page_size)
         self.main_window.pagination.update_buttons(
-            self.pages_count, self.filter.page_index, emit=False
+            self.pages_count, search_filter.page_index, emit=False
         )
-
+ 
+    def filter_items(self, filter: FilterState | None = None) -> None:
+        """Run a new search. If filter is None, it re-runs the current search from the UI."""
+        if not filter:
+            self.run_search_from_ui()
+        else:
+            # This is for one-off searches like context menu "search by tag id"
+            self.filter = filter
+            self.run_current_search()
+ 
+    def page_move(self, page_id: int) -> None:
+        if not self.lib.library_dir: return
+ 
+        self.filter.page_index = page_id
+        self.run_current_search()
     def remove_recent_library(self, item_key: str):
         self.cached_values.beginGroup(SettingItems.LIBS_LIST)
         self.cached_values.remove(item_key)
@@ -2081,20 +2103,20 @@ class QtDriver(DriverMixin, QObject):
                 error_desc=open_status.msg_description,
             )
             return open_status
-
+ 
         self.init_workers()
-
+ 
         self.filter.page_size = self.settings.page_size
-
+ 
         # TODO - make this call optional
-        if self.lib.entries_count < 10000:
-            self.add_new_files_callback()
-
+        self.update_global_filter_ast()
+        self.add_new_files_callback()
+ 
         if self.settings.show_filepath == ShowFilepathOption.SHOW_FULL_PATHS:
-            library_dir_display = self.lib.library_dir
+            library_dir_display = self.lib.library_dir if self.lib.library_dir else ""
         else:
-            library_dir_display = self.lib.library_dir.name
-
+            library_dir_display = self.lib.library_dir.name if self.lib.library_dir else ""
+ 
         self.update_libs_list(path)
         self.main_window.setWindowTitle(
             Translations.format(
@@ -2104,9 +2126,9 @@ class QtDriver(DriverMixin, QObject):
             )
         )
         self.main_window.setAcceptDrops(True)
-
+ 
         self.init_file_extension_manager()
-
+ 
         self.selected.clear()
         self.set_select_actions_visibility()
         self.save_library_backup_action.setEnabled(True)
@@ -2120,12 +2142,10 @@ class QtDriver(DriverMixin, QObject):
         self.fix_unlinked_entries_action.setEnabled(True)
         self.clear_thumb_cache_action.setEnabled(True)
         self.folders_to_tags_action.setEnabled(True)
-
+ 
         self.preview_panel.update_widgets()
-
+ 
         # page (re)rendering, extract eventually
-        self.filter_items()
-
         self.main_window.toggle_landing_page(enabled=False)
         return open_status
 

@@ -9,6 +9,7 @@ import typing
 from PySide6.QtCore import QMetaObject, QRect, QSize, QStringListModel, Qt
 from PySide6.QtWidgets import (
     QComboBox,
+    QCheckBox,
     QCompleter,
     QFrame,
     QGridLayout,
@@ -72,7 +73,7 @@ class Ui_MainWindow(QMainWindow):
         self.horizontalLayout_3.setObjectName("horizontalLayout_3")
   
         # left side spacer
-        spacerItem = QSpacerItem(40, 20, QSizePolicy.Expanding, QSizePolicy.Minimum)
+        spacerItem = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self.horizontalLayout_3.addItem(spacerItem)
   
         # Sorting Dropdowns
@@ -89,7 +90,7 @@ class Ui_MainWindow(QMainWindow):
         self.thumb_size_combobox.setObjectName(u"thumbSizeComboBox")
         self.thumb_size_combobox.setPlaceholderText(Translations["home.thumbnail_size"])
         self.thumb_size_combobox.setCurrentText("")
-        sizePolicy = QSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        sizePolicy = QSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
         sizePolicy.setHeightForWidth(
@@ -110,9 +111,9 @@ class Ui_MainWindow(QMainWindow):
 
         self.scrollArea = QScrollArea()
         self.scrollArea.setObjectName(u"scrollArea")
-        self.scrollArea.setFocusPolicy(Qt.WheelFocus)
-        self.scrollArea.setFrameShape(QFrame.NoFrame)
-        self.scrollArea.setFrameShadow(QFrame.Plain)
+        self.scrollArea.setFocusPolicy(Qt.FocusPolicy.WheelFocus)
+        self.scrollArea.setFrameShape(QFrame.Shape.NoFrame)
+        self.scrollArea.setFrameShadow(QFrame.Shadow.Plain)
         self.scrollArea.setWidgetResizable(True)
         self.scrollAreaWidgetContents = QWidget()
         self.scrollAreaWidgetContents.setObjectName(
@@ -139,7 +140,7 @@ class Ui_MainWindow(QMainWindow):
         nav_button_style = "font-size:14;font-weight:bold;"
         self.horizontalLayout_2 = QHBoxLayout()
         self.horizontalLayout_2.setObjectName(u"horizontalLayout_2")
-        self.horizontalLayout_2.setSizeConstraint(QLayout.SetMinimumSize)
+        self.horizontalLayout_2.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         self.backButton = QPushButton("<", self.centralwidget)
         self.backButton.setObjectName(u"backButton")
         self.backButton.setMinimumSize(QSize(0, 32))
@@ -168,15 +169,21 @@ class Ui_MainWindow(QMainWindow):
         self.searchButton = QPushButton(Translations["home.search"], self.centralwidget)
         self.searchButton.setObjectName(u"searchButton")
         self.searchButton.setMinimumSize(QSize(0, 32))
-
+ 
         self.horizontalLayout_2.addWidget(self.searchButton)
+ 
+        self.global_filter_checkbox = QCheckBox(Translations["filter.enable_global_filter"])
+        self.global_filter_checkbox.setObjectName(u"globalFilterCheckbox")
+        self.global_filter_checkbox.setToolTip(Translations["filter.global_filter_tooltip"])
+        self.horizontalLayout_2.addWidget(self.global_filter_checkbox)
+ 
         self.gridLayout.addLayout(self.horizontalLayout_2, 3, 0, 1, 1)
         self.gridLayout_2.setContentsMargins(6, 6, 6, 6)
 
         MainWindow.setCentralWidget(self.centralwidget)
         self.statusbar = QStatusBar(MainWindow)
         self.statusbar.setObjectName(u"statusbar")
-        sizePolicy1 = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        sizePolicy1 = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         sizePolicy1.setHorizontalStretch(0)
         sizePolicy1.setVerticalStretch(0)
         sizePolicy1.setHeightForWidth(

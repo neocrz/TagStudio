@@ -146,18 +146,26 @@ class SettingsPanel(PanelWidget):
         self.theme_combobox.setCurrentIndex(list(THEME_MAP.keys()).index(theme))
         self.theme_combobox.currentIndexChanged.connect(self.__update_restart_label)
         form_layout.addRow(Translations["settings.theme.label"], self.theme_combobox)
-
+ 
+        # Global Filter
+        self.global_filter_line_edit = QLineEdit()
+        self.global_filter_line_edit.setText(self.driver.settings.global_filter)
+        self.global_filter_line_edit.setPlaceholderText(
+            Translations["settings.global_filter.placeholder"]
+        )
+        form_layout.addRow(Translations["settings.global_filter.label"], self.global_filter_line_edit)
+ 
     def __build_library_settings(self):
         self.library_settings_container = QWidget()
         form_layout = QFormLayout(self.library_settings_container)
         form_layout.setContentsMargins(6, 6, 6, 6)
-
+ 
         todo_label = QLabel("TODO")
         form_layout.addRow(todo_label)
-
+ 
     def __get_language(self) -> str:
         return list(LANGUAGES.values())[self.language_combobox.currentIndex()]
-
+ 
     def get_settings(self) -> dict:
         return {
             "language": self.__get_language(),
@@ -167,11 +175,12 @@ class SettingsPanel(PanelWidget):
             "page_size": int(self.page_size_line_edit.text()),
             "show_filepath": self.filepath_combobox.currentData(),
             "theme": self.theme_combobox.currentData(),
+            "global_filter": self.global_filter_line_edit.text(),
         }
-
+ 
     def update_settings(self, driver: "QtDriver"):
         settings = self.get_settings()
-
+ 
         driver.settings.language = settings["language"]
         driver.settings.open_last_loaded_on_startup = settings["open_last_loaded_on_startup"]
         driver.settings.autoplay = settings["autoplay"]
@@ -179,9 +188,11 @@ class SettingsPanel(PanelWidget):
         driver.settings.page_size = settings["page_size"]
         driver.settings.show_filepath = settings["show_filepath"]
         driver.settings.theme = settings["theme"]
-
+        driver.settings.global_filter = settings["global_filter"]
+ 
+        driver.update_global_filter_ast()
         driver.settings.save()
-
+ 
         # Apply changes
         # Show File Path
         driver.update_recent_lib_menu()
@@ -194,17 +205,22 @@ class SettingsPanel(PanelWidget):
         driver.main_window.setWindowTitle(
             Translations.format("app.title", base_title=driver.base_title, library_dir=display_path)
         )
-
+ 
     @classmethod
     def build_modal(cls, driver: "QtDriver") -> PanelModal:
         settings_panel = cls(driver)
-
+ 
+        def done_callback():
+            settings_panel.update_settings(driver)
+            # Re-run the current search to apply the new global filter
+            driver.run_current_search()
+ 
         modal = PanelModal(
             widget=settings_panel,
-            done_callback=lambda: settings_panel.update_settings(driver),
+            done_callback=done_callback,
             has_save=True,
         )
         modal.title_widget.setVisible(False)
         modal.setWindowTitle(Translations["settings.title"])
-
+ 
         return modal
